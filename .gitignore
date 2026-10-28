@@ -1,4 +1,4 @@
-﻿# Godot 缓存与导入产物
+# Godot 缓存与导入产物
 .godot/
 *.import
 
@@ -7,6 +7,7 @@ _*.log
 _*.err
 _zoom*.png
 shot.png
+shot_*.png
 
 # 备份
 main_backup_before_fsm.gd

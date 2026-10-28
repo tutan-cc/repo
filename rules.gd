@@ -130,6 +130,103 @@ static func waits(concealed: Array, melds: Array) -> Array:
 			out.append(t)
 	return out
 
+## 向听数：0=听牌，-1=已和牌。支持普通四组一对与七对。
+## 可传入共享 memo，让同回合多个候选弃牌复用中间状态。
+static func shanten(concealed: Array, melds: Array, memo: Variant = null) -> int:
+	var cache: Dictionary = memo if memo is Dictionary else {}
+	var standard := _standard_shanten(counts(concealed), melds.size(), cache)
+	var result := standard
+	if melds.is_empty():
+		result = mini(result, _seven_pairs_shanten(concealed))
+	return result
+
+static func _standard_shanten(counts: Dictionary, meld_count: int, memo: Dictionary) -> int:
+	var max_blocks := maxi(0, 4 - meld_count)
+	var best := _best_block_score(counts, 0, 0, 0, max_blocks, memo)
+	return 8 - meld_count * 2 - best
+
+static func _seven_pairs_shanten(concealed: Array) -> int:
+	var c := counts(concealed)
+	var pairs := 0
+	var kinds := 0
+	for value in c.values():
+		kinds += 1
+		if int(value) >= 2:
+			pairs += 1
+	return 6 - pairs + maxi(0, 7 - kinds)
+
+static func _without(c: Dictionary, t: int, n: int) -> Dictionary:
+	var out := c.duplicate()
+	out[t] = int(out[t]) - n
+	if int(out[t]) == 0:
+		out.erase(t)
+	return out
+
+## 返回 2*刻顺组 + 搭子 + 对子头的最大加权块数。
+static func _best_block_score(c: Dictionary, sets: int, taatsu: int, pair: int, max_blocks: int, memo: Dictionary) -> int:
+	var key := _state_key(c, sets, taatsu, pair, max_blocks)
+	if memo.has(key):
+		return int(memo[key])
+	var keys := c.keys()
+	if keys.is_empty():
+		var empty_score := sets * 2 + taatsu + pair
+		memo[key] = empty_score
+		return empty_score
+	keys.sort()
+	var t := int(keys[0])
+	var best := sets * 2 + taatsu + pair
+	var blocks := sets + taatsu
+	var probe: Dictionary
+
+	# 刻子
+	if int(c[t]) >= 3 and blocks < max_blocks:
+		probe = _without(c, t, 3)
+		best = maxi(best, _best_block_score(probe, sets + 1, taatsu, pair, max_blocks, memo))
+	# 顺子
+	if t < 27 and t % 9 <= 6 and int(c.get(t + 1, 0)) > 0 and int(c.get(t + 2, 0)) > 0 and blocks < max_blocks:
+		probe = c.duplicate()
+		for k in [t, t + 1, t + 2]:
+			probe[k] = int(probe[k]) - 1
+			if int(probe[k]) == 0:
+				probe.erase(k)
+		best = maxi(best, _best_block_score(probe, sets + 1, taatsu, pair, max_blocks, memo))
+	# 对子头
+	if pair == 0 and int(c[t]) >= 2:
+		probe = _without(c, t, 2)
+		best = maxi(best, _best_block_score(probe, sets, taatsu, 1, max_blocks, memo))
+	# 对子搭子
+	if int(c[t]) >= 2 and blocks < max_blocks:
+		probe = _without(c, t, 2)
+		best = maxi(best, _best_block_score(probe, sets, taatsu + 1, pair, max_blocks, memo))
+	# 相邻两面搭子
+	if t < 27 and t % 9 <= 7 and int(c.get(t + 1, 0)) > 0 and blocks < max_blocks:
+		probe = c.duplicate()
+		for k in [t, t + 1]:
+			probe[k] = int(probe[k]) - 1
+			if int(probe[k]) == 0:
+				probe.erase(k)
+		best = maxi(best, _best_block_score(probe, sets, taatsu + 1, pair, max_blocks, memo))
+	# 隔张搭子
+	if t < 27 and t % 9 <= 6 and int(c.get(t + 2, 0)) > 0 and blocks < max_blocks:
+		probe = c.duplicate()
+		for k in [t, t + 2]:
+			probe[k] = int(probe[k]) - 1
+			if int(probe[k]) == 0:
+				probe.erase(k)
+		best = maxi(best, _best_block_score(probe, sets, taatsu + 1, pair, max_blocks, memo))
+	# 放弃这张孤张
+	probe = _without(c, t, 1)
+	best = maxi(best, _best_block_score(probe, sets, taatsu, pair, max_blocks, memo))
+	memo[key] = best
+	return best
+
+static func _state_key(c: Dictionary, sets: int, taatsu: int, pair: int, max_blocks: int) -> String:
+	var bytes := PackedByteArray()
+	bytes.resize(34)
+	for i in range(34):
+		bytes[i] = int(c.get(i, 0))
+	return "%d%d%d%d:%s" % [max_blocks, sets, taatsu, pair, bytes.hex_encode()]
+
 ## 赔付：小胡 2 张/家，大胡 4，七对 8，龙七对 16
 static func payout(tier: String, stake: int) -> Dictionary:
 	var tiles := 2
