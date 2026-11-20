@@ -62,5 +62,14 @@ func _initialize() -> void:
 	if pay["total"] != 8 * 2 * 3:
 		fails += 1
 
+	# 四张东计两对；单张发财是唯一和牌。
+	var dragon_wait := [27,27,27,27,28,28,29,29,30,30,31,31,32]
+	var dragon_shanten := R.shanten(dragon_wait, [])
+	var dragon_waits := R.waits(dragon_wait, [])
+	var dragon_complete := dragon_wait + [32]
+	print("T9 龙七对向听=", dragon_shanten, " 听牌=", dragon_waits)
+	if dragon_shanten != 0 or dragon_waits != [32] or R.shanten(dragon_complete, []) != -1:
+		fails += 1
+
 	print("SELFTEST fails=", fails)
 	quit(0 if fails == 0 else 1)

@@ -146,14 +146,11 @@ static func _standard_shanten(counts: Dictionary, meld_count: int, memo: Diction
 	return 8 - meld_count * 2 - best
 
 static func _seven_pairs_shanten(concealed: Array) -> int:
-	var c := counts(concealed)
 	var pairs := 0
-	var kinds := 0
-	for value in c.values():
-		kinds += 1
-		if int(value) >= 2:
-			pairs += 1
-	return 6 - pairs + maxi(0, 7 - kinds)
+	for value in counts(concealed).values():
+		# 龙七对中四张同牌算两对。
+		pairs += int(value) >> 1
+	return 6 - pairs
 
 static func _without(c: Dictionary, t: int, n: int) -> Dictionary:
 	var out := c.duplicate()
@@ -167,13 +164,11 @@ static func _best_block_score(c: Dictionary, sets: int, taatsu: int, pair: int, 
 	var key := _state_key(c, sets, taatsu, pair, max_blocks)
 	if memo.has(key):
 		return int(memo[key])
-	var keys := c.keys()
-	if keys.is_empty():
+	if c.is_empty():
 		var empty_score := sets * 2 + taatsu + pair
 		memo[key] = empty_score
 		return empty_score
-	keys.sort()
-	var t := int(keys[0])
+	var t := int(c.keys().min())
 	var best := sets * 2 + taatsu + pair
 	var blocks := sets + taatsu
 	var probe: Dictionary
@@ -220,12 +215,14 @@ static func _best_block_score(c: Dictionary, sets: int, taatsu: int, pair: int, 
 	memo[key] = best
 	return best
 
-static func _state_key(c: Dictionary, sets: int, taatsu: int, pair: int, max_blocks: int) -> String:
-	var bytes := PackedByteArray()
-	bytes.resize(34)
-	for i in range(34):
-		bytes[i] = int(c.get(i, 0))
-	return "%d%d%d%d:%s" % [max_blocks, sets, taatsu, pair, bytes.hex_encode()]
+static func _state_key(c: Dictionary, sets: int, taatsu: int, pair: int, max_blocks: int) -> Vector4i:
+	# 每张牌的计数占 3 位。最后一组的高位保存拆牌进度。
+	var progress := (max_blocks << 7) | (sets << 4) | (taatsu << 1) | pair
+	var key := Vector4i(0, 0, 0, progress << 12)
+	for tile in c:
+		var group: int = int(tile) / 10
+		key[group] |= int(c[tile]) << ((int(tile) % 10) * 3)
+	return key
 
 ## 赔付：小胡 2 张/家，大胡 4，七对 8，龙七对 16
 static func payout(tier: String, stake: int) -> Dictionary:

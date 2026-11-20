@@ -1,6 +1,7 @@
 extends Node3D
 
 const MJRules = preload("res://rules.gd")
+const BoardRenderer = preload("res://board_renderer.gd")
 ## 重生2 · 麻将（纯 Godot 3D）
 ## 规则照搬 mahjong.js：四组一对 / 七对 / 龙七对 / 碰碰胡 / 大吊车 + 碰杠胡优先级
 
@@ -26,6 +27,7 @@ const TILE_NAMES := ["一万","二万","三万","四万","五万","六万","七�
 const CLAIM_DELAY := 1.0
 const AI_DRAW_DELAY := 1.0
 const AI_THINK := 1.3
+const QUICK_PACE := 0.55
 const STAKE := 2
 const CAM_H := 720.0     # 相机高度（越大越俯视）
 const CAM_D := 1180.0      # 相机到桌心的水平距离
@@ -50,7 +52,16 @@ var master_volume := 1.0
 var _persist_enabled := true
 var _save_path := SAVE_PATH
 var _round_label: Label
-var _score_label: Label
+var _seat_cards: Array[PanelContainer] = []
+var _seat_captions: Array[Label] = []
+var _active_seat_style: StyleBoxFlat
+var _idle_seat_style: StyleBoxFlat
+var _pace_btn: Button
+var _quick_pace := true
+var _last_discard: HBoxContainer
+var _last_discard_label: Label
+var _last_discard_icon: TextureRect
+var _hand_markers: Array[Label3D] = []
 var _rules_btn: Button
 var _rules_overlay: ColorRect
 var _rules_text: RichTextLabel
@@ -84,7 +95,6 @@ var result_detail: Label
 var restart_btn: Button
 var auto_pass := false
 var auto_peng := false
-var _last_discard_seat := -1
 var _drop_seat := -1
 var _anim_draw := true
 var _anim_deal := false
@@ -98,6 +108,11 @@ var _hud_hint: Label
 var _status_panel: PanelContainer
 var _status_style: StyleBoxFlat
 var _claim_panel: PanelContainer
+var _claim_caption: Label
+var _claim_faces: HBoxContainer
+var _claim_marker: MeshInstance3D
+var _claim_arrow: Label3D
+var _discard_previews := {}
 var _toast_panel: PanelContainer
 var _toast_tween: Tween
 var _result_overlay: ColorRect
@@ -156,12 +171,14 @@ var voice_player: AudioStreamPlayer
 var voice_streams := {}
 var call_player: AudioStreamPlayer
 var call_streams: Array = []
+var _pending_voice := ""
 
 func _init_calls() -> void:
 	call_player = AudioStreamPlayer.new()
 	call_player.volume_db = -4.0
 	call_player.bus = &"Voice"
 	add_child(call_player)
+	call_player.finished.connect(_play_pending_voice)
 	for i in range(34):
 		var s = load("res://sounds/calls/%d.wav" % i)
 		call_streams.append(s)
@@ -177,26 +194,34 @@ func _init_voice() -> void:
 			voice_streams[n] = s
 
 func _say(n: String) -> void:
+	_pending_voice = ""
 	if call_player:
 		call_player.stop()
 	if voice_player and voice_streams.has(n):
 		voice_player.stream = voice_streams[n]
+		voice_player.pitch_scale = 1.18 if _quick_pace else 1.0
 		voice_player.play()
 
-## 等牌名播报念完，再喊碰/杠/胡
+## 等牌名播报念完，再喊碰/杠/胡。
 func _say_after(n: String) -> void:
 	if call_player and call_player.playing:
-		var cb := func(): _say(n)
-		call_player.finished.connect(cb, CONNECT_ONE_SHOT)
+		_pending_voice = n
 	else:
 		_say(n)
+
+func _play_pending_voice() -> void:
+	if not _pending_voice.is_empty():
+		_say(_pending_voice)
 
 func _announce(kind: int) -> void:
 	if call_player == null or kind < 0 or kind >= call_streams.size():
 		return
-	var s = call_streams[kind]
-	if s:
-		call_player.stream = s
+	# 连续快速操作时，优先播完碰杠提示。
+	if not _pending_voice.is_empty() or (voice_player and voice_player.playing):
+		return
+	if call_streams[kind]:
+		call_player.stream = call_streams[kind]
+		call_player.pitch_scale = 1.18 if _quick_pace else 1.0
 		call_player.play()
 
 func _play(n: String, vol: float = -6.0) -> void:
@@ -271,7 +296,10 @@ var mat_plate: StandardMaterial3D
 var mat_gold: StandardMaterial3D
 var mat_rim: StandardMaterial3D
 var mat_back: StandardMaterial3D
-var board: Node3D
+var board: BoardRenderer
+var _board_section: Node3D
+var _tile_textures := {}
+var _face_materials := {}
 var cam: Camera3D
 var hud: Label
 var big: Label
@@ -363,6 +391,12 @@ func _ready() -> void:
 	if args.has("--robtest"):
 		_rob_test()
 		return
+	if args.has("--boardtest"):
+		_board_test()
+		return
+	if args.has("--boardbench"):
+		_board_benchmark()
+		return
 	if args.has("--kongtest"):
 		_kong_test()
 		return
@@ -421,6 +455,12 @@ func _new_game() -> void:
 	phase = "discard"
 	game_over = false
 	_win_context = {}
+	_claim_from = -1
+	_claim_tile = -1
+	_last_discard_index = -1
+	_pending_voice = ""
+	call_player.stop()
+	voice_player.stop()
 	_anim_draw = false
 	_anim_deal = true
 	if dealer == 0:
@@ -460,6 +500,7 @@ func _load_match_state() -> void:
 		ai_level = clampi(int(dict.get("ai_level", 1)), 0, 2)
 		master_volume = clampf(float(dict.get("master_volume", 1.0)), 0.0, 1.0)
 		_muted = bool(dict.get("muted", false))
+		_quick_pace = bool(dict.get("quick_pace", true))
 		return
 
 func _save_match_state() -> void:
@@ -473,6 +514,7 @@ func _save_match_state() -> void:
 		"ai_level": ai_level,
 		"master_volume": master_volume,
 		"muted": _muted,
+		"quick_pace": _quick_pace,
 	}
 	var tmp := _save_path + ".tmp"
 	var file := FileAccess.open(tmp, FileAccess.WRITE)
@@ -547,14 +589,16 @@ func _update_match_hud() -> void:
 		return
 	var prefix := "下一局  ·  " if game_over else ""
 	_round_label.text = "%s第 %d 局  ·  庄家：%s" % [prefix, hand_no, SEAT_NAMES[dealer]]
-	if _score_label == null:
-		return
-	var parts := PackedStringArray()
-	for i in range(4):
-		var value: int = scores[i]
-		var sign := "+" if value > 0 else ""
-		parts.append("%s %s%d" % [SEAT_NAMES[i], sign, value])
-	_score_label.text = "  ·  ".join(parts)
+	var active := -1 if game_over else (0 if st == St.HUMAN_CLAIM else turn)
+	for seat in range(_seat_cards.size()):
+		var highlighted := seat == active
+		_seat_cards[seat].add_theme_stylebox_override("panel", _active_seat_style if highlighted else _idle_seat_style)
+		var name: String = SEAT_NAMES[seat] + (" · 庄" if seat == dealer else "")
+		var score := scores[seat]
+		var score_text := "+%d" % score if score > 0 else str(score)
+		_seat_captions[seat].text = "%s     %s" % [name, score_text]
+		_seat_captions[seat].modulate = Color(1.0, 0.88, 0.60) if highlighted else Color(0.78, 0.87, 0.83)
+
 
 func _seat_screen_pos(seat: int) -> Vector2:
 	var viewport_size := Vector2(1240, 860)
@@ -743,10 +787,11 @@ var st: int = St.HUMAN_DISCARD
 var st_deadline := 0.0
 var _claim_from := -1
 var _claim_tile := -1
+var _last_discard_index := -1
 
 func _set_state(s: int, t: float = 0.0) -> void:
 	st = s
-	st_deadline = Time.get_ticks_msec() * 0.001 + t
+	st_deadline = Time.get_ticks_msec() * 0.001 + t * (QUICK_PACE if _quick_pace else 1.0)
 
 func _player_discard(idx: int) -> void:
 	if game_over or turn != 0 or st != St.HUMAN_DISCARD:
@@ -756,7 +801,6 @@ func _player_discard(idx: int) -> void:
 	var t: int = int(hands[0].pop_at(idx))
 	rivers[0].append(t)
 	_ev("%s 打 %s" % [SEAT_NAMES[0], TILE_NAMES[t]])
-	_last_discard_seat = 0
 	_drop_seat = 0
 	_play("discard", -8.0)
 	_add_trauma(0.06)
@@ -766,11 +810,13 @@ func _player_discard(idx: int) -> void:
 	_build()
 	_enter_claim(0, t)
 
-## 出牌后进入「等待」：停 CLAIM_DELAY 秒，让播报念完、玩家看清是谁打的
+## 出牌后短暂停留，再处理碰杠。
 func _enter_claim(from_seat: int, tile: int) -> void:
 	_claim_from = from_seat
 	_claim_tile = tile
+	_last_discard_index = rivers[from_seat].size() - 1
 	_set_state(St.CLAIM_WAIT, CLAIM_DELAY)
+	_update_hud()
 
 ## 兼容旧调用
 func _after_discard(from_seat: int, tile: int) -> void:
@@ -809,7 +855,7 @@ func _offer_self_kong(seat: int) -> void:
 		opts.append("angang")
 	if opts.is_empty():
 		return
-	_human_pending = { "opts": opts, "self": true, "bg": bg, "ag": ag }
+	_human_pending = { "opts": opts, "self_tiles": {"bugang": bg, "angang": ag} }
 	if auto_peng:
 		_on_claim(opts[0])
 	else:
@@ -906,6 +952,7 @@ func _do_self_kong(seat: int, tile: int, kind: String) -> void:
 			ph.append(tile)
 			var eh: Dictionary = MJRules.evaluate(ph, melds[0])
 			if not eh.is_empty():
+				hands[seat].erase(tile)
 				hands[0] = ph
 				_ev(">>> 你 抢杠 %s" % TILE_NAMES[tile])
 				_win(0, tile, eh, false, seat)
@@ -918,6 +965,7 @@ func _do_self_kong(seat: int, tile: int, kind: String) -> void:
 			pr.append(tile)
 			var er: Dictionary = MJRules.evaluate(pr, melds[sr])
 			if not er.is_empty():
+				hands[seat].erase(tile)
 				hands[sr] = pr
 				_ev(">>> %s 抢杠 %s" % [SEAT_NAMES[sr], TILE_NAMES[tile]])
 				_win(sr, tile, er, false, seat)
@@ -944,11 +992,13 @@ func _do_self_kong(seat: int, tile: int, kind: String) -> void:
 		_finish("牌墙摸完 · 流局")
 		return
 	hands[seat].append(wall.pop_front())
+	if seat == 0:
+		drawn_index = hands[0].size() - 1
+		_anim_draw = true
 	_sort_hand(seat)
 	if _self_draw_win(seat):
 		return
 	if seat == 0:
-		drawn_index = -1
 		turn = 0
 		phase = "discard"
 		_set_state(St.HUMAN_DISCARD)
@@ -994,13 +1044,15 @@ func _do_ai_draw() -> void:
 	_set_state(St.AI_DISCARD, AI_THINK)
 	_build()
 
-func _visible_tile_count(t: int, concealed: Array) -> int:
-	var n := _count_in(concealed, t)
-	for s in range(4):
-		n += _count_in(rivers[s], t)
-		for m in melds[s]:
-			n += _count_in(m["tiles"], t)
-	return n
+func _visible_tile_counts(concealed: Array) -> Dictionary:
+	var seen := MJRules.counts(concealed)
+	for seat in range(4):
+		for tile in rivers[seat]:
+			seen[tile] = int(seen.get(tile, 0)) + 1
+		for meld in melds[seat]:
+			for tile in meld["tiles"]:
+				seen[tile] = int(seen.get(tile, 0)) + 1
+	return seen
 
 ## 14 张上手后，估算「留下这些牌」的搭子/对子质量。数值只用于 AI 比较，不参与规则。
 func _shape_score(tiles: Array) -> float:
@@ -1032,38 +1084,72 @@ func _shape_score(tiles: Array) -> float:
 		score += float(pairs) * 2.5
 	return score
 
-func _ai_discard_score(concealed: Array, seat: int) -> float:
-	var score := _shape_score(concealed)
-	var waits: Array = MJRules.waits(concealed, melds[seat])
-	if not waits.is_empty():
-		var live := 0
-		for t in waits:
-			live += maxi(0, 4 - _visible_tile_count(int(t), concealed))
-		score += 10000.0 + float(live) * 120.0
-	return score
+func _live_copies(tile: int, seen: Dictionary) -> int:
+	return maxi(0, 4 - int(seen.get(tile, 0)))
+
+func _live_wait_count(waits: Array, seen: Dictionary) -> int:
+	var live := 0
+	for tile in waits:
+		live += _live_copies(int(tile), seen)
+	return live
+
+func _effective_tile_count(hand: Array, exposed: Array, distance: int, seen: Dictionary, cache: Dictionary) -> int:
+	if distance <= 0:
+		return _live_wait_count(MJRules.waits(hand, exposed), seen)
+	var total := 0
+	var probe := hand.duplicate()
+	for tile in range(KINDS):
+		var live := _live_copies(tile, seen)
+		if live == 0:
+			continue
+		probe.append(tile)
+		if MJRules.shanten(probe, exposed, cache) < distance:
+			total += live
+		probe.pop_back()
+	return total
 
 func _ai_choose_discard(seat: int) -> int:
-	if hands[seat].is_empty():
+	var hand: Array = hands[seat]
+	if hand.is_empty():
 		return 0
 	if ai_level == 0:
-		return randi() % hands[seat].size()
-	var best_indices: Array[int] = []
-	var best_score := -1.0e20
-	var shanten_cache := {}
-	for i in range(hands[seat].size()):
-		var probe: Array = hands[seat].duplicate()
-		probe.remove_at(i)
-		var score := _ai_discard_score(probe, seat)
+		return randi() % hand.size()
+
+	# 打掉的牌马上进入牌河，计算有效牌时仍然属于已知牌。
+	var seen := _visible_tile_counts(hand)
+	var exposed: Array = melds[seat]
+	var candidates := {}
+	var cache := {}
+	var best_distance := 99
+	for tile in hand:
+		if candidates.has(tile):
+			continue
+		var probe := hand.duplicate()
+		probe.erase(tile)
+		var distance := MJRules.shanten(probe, exposed, cache) if ai_level >= 2 else 0
+		candidates[tile] = {"hand": probe, "distance": distance}
+		best_distance = mini(best_distance, distance)
+
+	var best_tiles: Array[int] = []
+	var best_score := -INF
+	for tile in candidates:
+		var candidate: Dictionary = candidates[tile]
+		if int(candidate["distance"]) != best_distance:
+			continue
+		var probe: Array = candidate["hand"]
+		var score := _shape_score(probe)
 		if ai_level >= 2:
-			score += -float(MJRules.shanten(probe, melds[seat], shanten_cache)) * 3000.0
+			score += 1000.0 * _effective_tile_count(probe, exposed, best_distance, seen, cache)
+		else:
+			var live := _live_wait_count(MJRules.waits(probe, exposed), seen)
+			if live > 0:
+				score += 10000.0 + 120.0 * live
 		if score > best_score + 0.0001:
 			best_score = score
-			best_indices = [i]
+			best_tiles = [int(tile)]
 		elif abs(score - best_score) <= 0.0001:
-			best_indices.append(i)
-	if best_indices.is_empty():
-		return 0
-	return int(best_indices[randi() % best_indices.size()])
+			best_tiles.append(int(tile))
+	return hand.find(best_tiles[randi() % best_tiles.size()])
 
 func _do_ai_discard() -> void:
 	var seat := turn
@@ -1073,7 +1159,6 @@ func _do_ai_discard() -> void:
 	var tile: int = int(hands[seat].pop_at(best))
 	rivers[seat].append(tile)
 	_ev("%s 打 %s" % [SEAT_NAMES[seat], TILE_NAMES[tile]])
-	_last_discard_seat = seat
 	_drop_seat = seat
 	_play("discard", -13.0)
 	_add_trauma(0.035)
@@ -1164,7 +1249,7 @@ func _make_result_tile(kind: int, highlight: bool = false, meld: bool = false) -
 	slot.custom_minimum_size = Vector2(32, 44)
 	slot.tooltip_text = TILE_NAMES[kind]
 	slot.add_theme_stylebox_override("panel", _tile_slot_style(highlight, meld))
-	var tex := load("res://faces/%s.png" % _face_key(kind)) as Texture2D
+	var tex := _face_texture(kind)
 	if tex:
 		var img := TextureRect.new()
 		img.texture = tex
@@ -1448,13 +1533,11 @@ func _env() -> void:
 
 func _box(size: Vector3, pos: Vector3, ry: float, m: Material) -> MeshInstance3D:
 	var mi := MeshInstance3D.new()
-	var bm := BoxMesh.new()
-	bm.size = size
-	mi.mesh = bm
+	mi.mesh = board.box_mesh(size)
 	mi.material_override = m
 	mi.position = pos
 	mi.rotation.y = ry
-	board.add_child(mi)
+	_board_section.add_child(mi)
 	return mi
 
 func _face_key(kind: int) -> String:
@@ -1467,54 +1550,85 @@ func _face_key(kind: int) -> String:
 	var honor := ["feng_dong", "feng_nan", "feng_xi", "feng_bei", "jian_zhong", "jian_fa", "jian_bai"]
 	return honor[kind - 27]
 
-func _face_quad(kind: int, pos: Vector3, size: Vector2, rot: Vector3) -> void:
-	var q := MeshInstance3D.new()
-	var qm := QuadMesh.new()
-	qm.size = size
-	q.mesh = qm
-	var m := StandardMaterial3D.new()
-	var tex = load("res://faces/%s.png" % _face_key(kind))
-	if tex:
-		m.albedo_texture = tex
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.cull_mode = BaseMaterial3D.CULL_DISABLED
-	q.material_override = m
-	q.position = pos
-	q.rotation = rot
-	board.add_child(q)
+func _face_texture(kind: int) -> Texture2D:
+	if not _tile_textures.has(kind):
+		_tile_textures[kind] = load("res://faces/%s.png" % _face_key(kind)) as Texture2D
+	return _tile_textures[kind]
 
-# ────────────────────────── 重建 ──────────────────────────
+
 func _build() -> void:
-	_hand_nodes.clear()
-	_hovered_index = -1
-	if _hover_label:
-		_hover_label.visible = false
-	Input.set_default_cursor_shape(Input.CURSOR_ARROW)
-	if board and is_instance_valid(board):
-		board.visible = false
-		board.queue_free()
-	board = Node3D.new()
-	board.name = "Board"
-	add_child(board)
-	_box(Vector3(1300, 46, 1090), Vector3(0, -24, 0), 0, mat_rim)
-	_box(Vector3(1210, 26, 1010), Vector3(0, -13, 0), 0, mat_felt)
-# 桌面金边
-	_box(Vector3(1150, 2, 3), Vector3(0, 0.6, 468), 0, mat_gold)
-	_box(Vector3(1150, 2, 3), Vector3(0, 0.6, -468), 0, mat_gold)
-	_box(Vector3(3, 2, 940), Vector3(577, 0.6, 0), 0, mat_gold)
-	_box(Vector3(3, 2, 940), Vector3(-577, 0.6, 0), 0, mat_gold)
+	_discard_previews.clear()
+	if board == null:
+		_init_board()
 
-	_build_wall()
-	_build_rivers()
-	_build_hand()
-	_build_other_hands()
-	_build_melds()
-	_build_center()
-	_build_seats()
+	board.update_wall(wall.size())
+	for seat in range(4):
+		_board_section = board.begin_section("River%d" % seat, rivers[seat])
+		if _board_section:
+			_build_river(seat)
+		_board_section = board.begin_section("Melds%d" % seat, melds[seat])
+		if _board_section:
+			_build_melds(seat)
+		if seat != 0:
+			_board_section = board.begin_section("Hand%d" % seat, [hands[seat].size()])
+			if _board_section:
+				_build_other_hand(seat)
+
+	_board_section = board.begin_section("Hand0", [hands[0], drawn_index, _hand_shift(), hand_no])
+	if _board_section:
+		_set_hovered_hand(-1)
+		_hand_nodes.clear()
+		_hand_markers.clear()
+		_build_hand()
+	elif _hovered_index >= 0:
+		_hover_label.text = _discard_preview(_hovered_index)
+
+	var seat_counts: Array[int] = []
+	for seat in range(4):
+		var count: int = hands[seat].size()
+		for meld in melds[seat]:
+			count += meld["tiles"].size()
+		seat_counts.append(count)
+	_board_section = board.begin_section("SeatLabels", [seat_counts, turn, wall.size()])
+	if _board_section:
+		_build_seats(seat_counts)
+
 	_drop_seat = -1
 	_anim_draw = false
 	_anim_deal = false
 	_update_hud()
+
+
+func _init_board() -> void:
+	board = BoardRenderer.new()
+	board.name = "Board"
+	add_child(board)
+	_board_section = board.begin_section("Table", [])
+	_box(Vector3(1300, 46, 1090), Vector3(0, -24, 0), 0, mat_rim)
+	_box(Vector3(1210, 26, 1010), Vector3(0, -13, 0), 0, mat_felt)
+	_box(Vector3(1150, 2, 3), Vector3(0, 0.6, 468), 0, mat_gold)
+	_box(Vector3(1150, 2, 3), Vector3(0, 0.6, -468), 0, mat_gold)
+	_box(Vector3(3, 2, 940), Vector3(577, 0.6, 0), 0, mat_gold)
+	_box(Vector3(3, 2, 940), Vector3(-577, 0.6, 0), 0, mat_gold)
+	_build_river_mats()
+	_build_center()
+	var marker_material := StandardMaterial3D.new()
+	marker_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	marker_material.albedo_color = Color(1.0, 0.76, 0.28)
+	_claim_marker = _box(Vector3(40.5, 1.0, 40.5), Vector3.ZERO, 0, marker_material)
+	_claim_marker.hide()
+	_claim_arrow = Label3D.new()
+	_claim_arrow.text = "▼"
+	_claim_arrow.font_size = 48
+	_claim_arrow.pixel_size = 0.48
+	_claim_arrow.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	_claim_arrow.no_depth_test = true
+	_claim_arrow.modulate = Color(1.0, 0.76, 0.28)
+	_claim_arrow.hide()
+	_claim_marker.add_child(_claim_arrow)
+	_claim_arrow.position.y = 49.0
+	_board_section = board.begin_section("Wall", [])
+	_build_wall_pool()
 
 
 ## 把一个牌的所有零件装进同一个容器，方便整体做补间
@@ -1522,35 +1636,31 @@ func _tile_group(pos: Vector3, ry: float) -> Node3D:
 	var root := Node3D.new()
 	root.position = pos
 	root.rotation.y = ry
-	board.add_child(root)
+	_board_section.add_child(root)
 	return root
 
 func _part(root: Node3D, size: Vector3, off: Vector3, m: Material) -> void:
 	var mi := MeshInstance3D.new()
-	var bm := BoxMesh.new()
-	bm.size = size
-	mi.mesh = bm
+	mi.mesh = board.box_mesh(size)
 	mi.material_override = m
 	mi.position = off
 	root.add_child(mi)
 
 func _part_face(root: Node3D, kind: int, off: Vector3, size: Vector2, rot: Vector3) -> void:
-	var q := MeshInstance3D.new()
-	var qm := QuadMesh.new()
-	qm.size = size
-	q.mesh = qm
-	var m := StandardMaterial3D.new()
-	var tex = load("res://faces/%s.png" % _face_key(kind))
-	if tex:
-		m.albedo_texture = tex
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.cull_mode = BaseMaterial3D.CULL_DISABLED
-	# 牌面图 224×312 缩到 ~34px：必须开各向异性 + mipmap，否则糊成一片
-	m.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
-	q.material_override = m
-	q.position = off
-	q.rotation = rot
-	root.add_child(q)
+	if not _face_materials.has(kind):
+		var material := StandardMaterial3D.new()
+		material.albedo_texture = _face_texture(kind)
+		material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		material.cull_mode = BaseMaterial3D.CULL_DISABLED
+		material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
+		_face_materials[kind] = material
+	var face := MeshInstance3D.new()
+	face.mesh = board.quad_mesh(size)
+	face.material_override = _face_materials[kind]
+	face.position = off
+	face.rotation = rot
+	root.add_child(face)
+
 
 ## 立着的牌（手牌）：牌厚 = HAND_T，凹槽和面片贴在正面外侧
 func _tile_upright(pos: Vector3, kind: int, sc: float = 1.0) -> Node3D:
@@ -1576,7 +1686,7 @@ func _tile_flat(pos: Vector3, ry: float, kind: int, sc: float = 1.0) -> Node3D:
 	_part(root, Vector3(RIVER_S - 5.0, 1.2, RIVER_S - 5.0), Vector3(0, T + 1.4, 0), mat_plate)
 	_part_face(root, kind, Vector3(0, T + 2.1, 0), Vector2(RIVER_S - 9, RIVER_S - 9), Vector3(-PI * 0.5, 0, 0))
 	return root
-func _build_wall() -> void:
+func _build_wall_pool() -> void:
 	var slots: Array = []
 	var step := TW + GAP
 	var half := (PER_SIDE - 1) * step * 0.5
@@ -1597,21 +1707,16 @@ func _build_wall() -> void:
 				p = Vector3(RINX + TD * 0.5, 0, off)
 				ry = PI * 0.5
 			slots.append({ "pos": p, "ry": ry })
-	var remain: int = wall.size()
-	var keep: int = int(ceil(remain / 2.0))
-	if keep <= 0:
-		return
-	var use: Array = slots.slice(max(0, slots.size() - keep), slots.size())
-	# 余牌为奇数时，破墙那一墩只剩下面一张（上面那张已被摸走）
-	for k in range(use.size()):
-		var s = use[k]
-		var layers := 2
-		if remain % 2 == 1 and k == 0:
-			layers = 1
-		for i in range(layers):
-			var y0 := i * (TH + 0.8)
-			_box(Vector3(TW, TH, TD), s["pos"] + Vector3(0, y0 + TH * 0.5, 0), s["ry"], mat_ivory)
-			_box(Vector3(TW - 0.6, 1.2, TD - 0.6), s["pos"] + Vector3(0, y0 + TH - 0.3, 0), s["ry"], mat_green)
+	# 逐墩从尾部编号，每墩先显示下层，再显示上层，保持原来的破墙方式。
+	for k in range(slots.size() - 1, -1, -1):
+		var slot: Dictionary = slots[k]
+		for layer in range(2):
+			var y := layer * (TH + 0.8)
+			var pos: Vector3 = slot["pos"]
+			var tile := _tile_group(pos + Vector3(0, y, 0), slot["ry"])
+			_part(tile, Vector3(TW, TH, TD), Vector3(0, TH * 0.5, 0), mat_ivory)
+			_part(tile, Vector3(TW - 0.6, 1.2, TD - 0.6), Vector3(0, TH - 0.3, 0), mat_green)
+			board.add_wall_tile(tile)
 
 func _river_slot(seat: int, i: int) -> Dictionary:
 	var per_row := 6
@@ -1638,7 +1743,7 @@ func _river_slot(seat: int, i: int) -> Dictionary:
 			ry = -PI * 0.5
 	return { "pos": p, "ry": ry }
 
-func _build_rivers() -> void:
+func _build_river_mats() -> void:
 	var rcols := [Color(0.10, 0.17, 0.28), Color(0.11, 0.21, 0.15), Color(0.26, 0.13, 0.12), Color(0.24, 0.21, 0.10)]
 	for s in range(4):
 		var rm := StandardMaterial3D.new()
@@ -1658,18 +1763,19 @@ func _build_rivers() -> void:
 				rp = Vector3(150, 0.4, 0)
 				rs = Vector3(84, 0.8, 272)
 		_box(rs, rp, 0, rm)
-	for seat in range(4):
-		for i in range(rivers[seat].size()):
-			var sl := _river_slot(seat, i)
-			var kind: int = int(rivers[seat][i])
-			var rf: Node3D = _tile_flat(sl["pos"], sl["ry"], kind, 0.78)
-			if seat == _drop_seat and i == rivers[seat].size() - 1:
-				rf.position.y += 70.0
-				rf.scale = Vector3(0.86, 0.86, 0.86)
-				var tw2 := create_tween()
-				tw2.set_parallel(true)
-				tw2.tween_property(rf, "position:y", sl["pos"].y, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
-				tw2.tween_property(rf, "scale", Vector3.ONE, 0.22)
+
+func _build_river(seat: int) -> void:
+	for i in range(rivers[seat].size()):
+		var sl := _river_slot(seat, i)
+		var kind: int = int(rivers[seat][i])
+		var rf: Node3D = _tile_flat(sl["pos"], sl["ry"], kind, 0.78)
+		if seat == _drop_seat and i == rivers[seat].size() - 1:
+			rf.position.y += 70.0
+			rf.scale = Vector3(0.86, 0.86, 0.86)
+			var tw2 := rf.create_tween()
+			tw2.set_parallel(true)
+			tw2.tween_property(rf, "position:y", sl["pos"].y, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+			tw2.tween_property(rf, "scale", Vector3.ONE * 0.78, 0.22)
 
 func _hand_x(i: int, n: int) -> float:
 	var half := (n - 1) * HAND_STEP * 0.5
@@ -1689,6 +1795,17 @@ func _build_hand() -> void:
 		var tn: Node3D = _tile_upright(p, int(hands[0][i]))
 		tn.set_meta("hover_base_scale", tn.scale)
 		_hand_nodes.append(tn)
+		var marker := Label3D.new()
+		marker.position = Vector3(0, HAND_H * 0.5 + 11.0, HAND_T * 0.5)
+		marker.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		marker.no_depth_test = true
+		marker.font_size = 54
+		marker.pixel_size = 0.46
+		marker.outline_size = 15
+		marker.outline_modulate = Color(0.01, 0.04, 0.05, 0.97)
+		marker.hide()
+		tn.add_child(marker)
+		_hand_markers.append(marker)
 		if animate_deal:
 			tn.position.y -= 62.0
 			var tw := tn.create_tween()
@@ -1699,62 +1816,60 @@ func _build_hand() -> void:
 			var tw := tn.create_tween()
 			tw.tween_property(tn, "position:y", p.y, 0.28).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
-func _build_other_hands() -> void:
-	for seat in [1, 2, 3]:
-		var n: int = hands[seat].size()
-		for i in range(n):
-			var x := _hand_x(i, n)
-			match seat:
-				2:
-					_box(Vector3(HAND_W, HAND_H, HAND_T), Vector3(-x, HAND_H * 0.5, -HAND_Z), 0, mat_ivory)
-					_box(Vector3(HAND_W - 3, HAND_H - 3, 1.2), Vector3(-x, HAND_H * 0.5, -HAND_Z + HAND_T * 0.5 + 0.4), 0, mat_back)
-				1:
-					_box(Vector3(HAND_T, HAND_H, HAND_W), Vector3(HAND_X, HAND_H * 0.5, x), 0, mat_ivory)
-					_box(Vector3(1.2, HAND_H - 3, HAND_W - 3), Vector3(HAND_X - HAND_T * 0.5 - 0.4, HAND_H * 0.5, x), 0, mat_back)
-				3:
-					_box(Vector3(HAND_T, HAND_H, HAND_W), Vector3(-HAND_X, HAND_H * 0.5, -x), 0, mat_ivory)
-					_box(Vector3(1.2, HAND_H - 3, HAND_W - 3), Vector3(-HAND_X + HAND_T * 0.5 + 0.4, HAND_H * 0.5, -x), 0, mat_back)
+func _build_other_hand(seat: int) -> void:
+	var n: int = hands[seat].size()
+	for i in range(n):
+		var x := _hand_x(i, n)
+		match seat:
+			2:
+				_box(Vector3(HAND_W, HAND_H, HAND_T), Vector3(-x, HAND_H * 0.5, -HAND_Z), 0, mat_ivory)
+				_box(Vector3(HAND_W - 3, HAND_H - 3, 1.2), Vector3(-x, HAND_H * 0.5, -HAND_Z + HAND_T * 0.5 + 0.4), 0, mat_back)
+			1:
+				_box(Vector3(HAND_T, HAND_H, HAND_W), Vector3(HAND_X, HAND_H * 0.5, x), 0, mat_ivory)
+				_box(Vector3(1.2, HAND_H - 3, HAND_W - 3), Vector3(HAND_X - HAND_T * 0.5 - 0.4, HAND_H * 0.5, x), 0, mat_back)
+			3:
+				_box(Vector3(HAND_T, HAND_H, HAND_W), Vector3(-HAND_X, HAND_H * 0.5, -x), 0, mat_ivory)
+				_box(Vector3(1.2, HAND_H - 3, HAND_W - 3), Vector3(-HAND_X + HAND_T * 0.5 + 0.4, HAND_H * 0.5, -x), 0, mat_back)
 
-func _build_melds() -> void:
-	for seat in range(4):
-		var list: Array = melds[seat]
-		if list.is_empty():
-			continue
-		# 锚在各家「右下角」的外圈，新牌往右加、旧牌往左挤（锚点固定 = 右对齐）
-		var anchor := Vector3.ZERO
-		var dir := Vector3.ZERO
-		match seat:
-			0:
-				anchor = Vector3(470, 0, 468)
-				dir = Vector3(-50, 0, 0)
-			1:
-				anchor = Vector3(500, 0, -430)
-				dir = Vector3(0, 0, 50)
-			2:
-				anchor = Vector3(-470, 0, -468)
-				dir = Vector3(50, 0, 0)
-			3:
-				anchor = Vector3(-500, 0, 430)
-				dir = Vector3(0, 0, -50)
-		# 摊平成一条，最新的牌放在最右（锚点），旧的依次往左推
-		var flat: Array = []
-		for m in list:
-			for t in m["tiles"]:
-				flat.append(int(t))
-		var mry := 0.0
-		match seat:
-			1:
-				mry = PI * 0.5
-			2:
-				mry = PI
-			3:
-				mry = -PI * 0.5
-		var idx := 0.0
-		for i in range(flat.size() - 1, -1, -1):
-			_tile_flat(anchor + dir * idx, mry, flat[i])
-			idx += 1.0
-			if (flat.size() - 1 - i) % 3 == 2:
-				idx += 0.35
+func _build_melds(seat: int) -> void:
+	var list: Array = melds[seat]
+	if list.is_empty():
+		return
+	# 锚在各家「右下角」的外圈，新牌往右加、旧牌往左挤（锚点固定 = 右对齐）
+	var anchor := Vector3.ZERO
+	var dir := Vector3.ZERO
+	match seat:
+		0:
+			anchor = Vector3(470, 0, 468)
+			dir = Vector3(-50, 0, 0)
+		1:
+			anchor = Vector3(500, 0, -430)
+			dir = Vector3(0, 0, 50)
+		2:
+			anchor = Vector3(-470, 0, -468)
+			dir = Vector3(50, 0, 0)
+		3:
+			anchor = Vector3(-500, 0, 430)
+			dir = Vector3(0, 0, -50)
+	# 摊平成一条，最新的牌放在最右（锚点），旧的依次往左推
+	var flat: Array = []
+	for m in list:
+		for t in m["tiles"]:
+			flat.append(int(t))
+	var mry := 0.0
+	match seat:
+		1:
+			mry = PI * 0.5
+		2:
+			mry = PI
+		3:
+			mry = -PI * 0.5
+	var idx := 0.0
+	for i in range(flat.size() - 1, -1, -1):
+		_tile_flat(anchor + dir * idx, mry, flat[i])
+		idx += 1.0
+		if (flat.size() - 1 - i) % 3 == 2:
+			idx += 0.35
 func _build_center() -> void:
 	var cyl := MeshInstance3D.new()
 	var cm := CylinderMesh.new()
@@ -1767,7 +1882,7 @@ func _build_center() -> void:
 	m.roughness = 0.45
 	cyl.material_override = m
 	cyl.position = Vector3(0, 3, 0)
-	board.add_child(cyl)
+	_board_section.add_child(cyl)
 
 	var ring := MeshInstance3D.new()
 	var tm := TorusMesh.new()
@@ -1776,20 +1891,17 @@ func _build_center() -> void:
 	ring.mesh = tm
 	ring.material_override = mat_gold
 	ring.position = Vector3(0, 5.5, 0)
-	board.add_child(ring)
+	_board_section.add_child(ring)
 	# (已在上方 add_child)
 
 ## 四家名牌 + 中央剩余张数
-func _build_seats() -> void:
+func _build_seats(seat_counts: Array[int]) -> void:
 	var names := ["你", "下家", "对家", "上家"]
 	# 座位 0 下、1 右（下家）、2 上、3 左（上家）—— 逆时针出牌
 	var spots := [Vector3(0, 60, 545), Vector3(500, 150, 0), Vector3(0, 150, -470), Vector3(-500, 150, 0)]
 	for s in range(4):
 		var l := Label3D.new()
-		var cnt: int = hands[s].size()
-		for m in melds[s]:
-			cnt += m["tiles"].size()
-		l.text = "%s  %d 张" % [names[s], cnt]
+		l.text = "%s  %d 张" % [names[s], seat_counts[s]]
 		l.font_size = 48
 		l.pixel_size = 0.34
 		l.outline_size = 9
@@ -1798,7 +1910,7 @@ func _build_seats() -> void:
 		l.no_depth_test = true
 		l.modulate = Color(1, 0.86, 0.45) if s == turn else Color(0.78, 0.86, 0.82, 0.88)
 		l.position = spots[s]
-		board.add_child(l)
+		_board_section.add_child(l)
 		if s == turn:
 			var pulse := l.create_tween()
 			pulse.set_loops()
@@ -1815,7 +1927,7 @@ func _build_seats() -> void:
 	c.no_depth_test = true
 	c.modulate = Color(0.95, 0.93, 0.75)
 	c.position = Vector3(0, 18, 0)
-	board.add_child(c)
+	_board_section.add_child(c)
 
 	var wall_cap := Label3D.new()
 	wall_cap.text = "牌墙"
@@ -1827,7 +1939,7 @@ func _build_seats() -> void:
 	wall_cap.no_depth_test = true
 	wall_cap.modulate = Color(0.86, 0.90, 0.80, 0.94)
 	wall_cap.position = Vector3(0, 68, 0)
-	board.add_child(wall_cap)
+	_board_section.add_child(wall_cap)
 
 # ────────────────────────── HUD ──────────────────────────
 func _make_hud() -> void:
@@ -1851,9 +1963,16 @@ func _make_hud() -> void:
 	_round_label = _ui_label("", 12, Color(0.92, 0.80, 0.53, 0.94))
 	_round_label.position = Vector2(30, 71)
 	root.add_child(_round_label)
-	_score_label = _ui_label("", 11, Color(0.70, 0.78, 0.73, 0.92))
-	_score_label.position = Vector2(30, 91)
-	root.add_child(_score_label)
+	_pace_btn = Button.new()
+	_pace_btn.position = Vector2(28, 98)
+	_pace_btn.custom_minimum_size = Vector2(112, 31)
+	_pace_btn.focus_mode = Control.FOCUS_NONE
+	_style_button(_pace_btn, Color(0.07, 0.14, 0.13), Color(0.49, 0.71, 0.65))
+	_pace_btn.add_theme_font_size_override("font_size", 13)
+	_pace_btn.tooltip_text = "切换电脑行动速度"
+	_pace_btn.pressed.connect(_toggle_pace)
+	root.add_child(_pace_btn)
+	_update_pace_button()
 
 	_rules_btn = Button.new()
 	_rules_btn.text = "规则  R"
@@ -1896,14 +2015,21 @@ func _make_hud() -> void:
 	root.add_child(_status_panel)
 	var status_box := VBoxContainer.new()
 	status_box.alignment = BoxContainer.ALIGNMENT_CENTER
+	status_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	status_box.add_theme_constant_override("separation", 0)
-	_status_panel.add_child(status_box)
+	var status_row := HBoxContainer.new()
+	status_row.add_theme_constant_override("separation", 12)
+	_status_panel.add_child(status_row)
+	status_row.add_child(status_box)
+	_make_recent_discard(status_row)
 	hud = _ui_label("", 22, Color(1.0, 0.92, 0.72))
 	hud.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	status_box.add_child(hud)
 	_hud_hint = _ui_label("", 12, Color(0.72, 0.82, 0.76, 0.92))
 	_hud_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_hud_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	status_box.add_child(_hud_hint)
+	_make_seat_strip(root)
 
 	# 左下：牌局记录
 	var log_panel := PanelContainer.new()
@@ -1938,8 +2064,8 @@ func _make_hud() -> void:
 	_toast_panel.anchor_right = 0.5
 	_toast_panel.offset_left = -320.0
 	_toast_panel.offset_right = 320.0
-	_toast_panel.offset_top = 92.0
-	_toast_panel.offset_bottom = 142.0
+	_toast_panel.offset_top = 148.0
+	_toast_panel.offset_bottom = 188.0
 	_toast_panel.add_theme_stylebox_override("panel", _panel_style(Color(0.16, 0.10, 0.035, 0.94), Color(0.89, 0.64, 0.24, 0.85), 12))
 	_toast_panel.pivot_offset = Vector2(320, 25)
 	_toast_panel.visible = false
@@ -1955,15 +2081,15 @@ func _make_hud() -> void:
 	_hover_label.anchor_right = 0.5
 	_hover_label.anchor_top = 1.0
 	_hover_label.anchor_bottom = 1.0
-	_hover_label.offset_left = -220.0
-	_hover_label.offset_right = 220.0
+	_hover_label.offset_left = -440.0
+	_hover_label.offset_right = 440.0
 	_hover_label.offset_top = -208.0
 	_hover_label.offset_bottom = -178.0
 	_hover_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_hover_label.visible = false
 	root.add_child(_hover_label)
 
-	var control_hint := _ui_label("左键出牌  ·  P/G 响应  ·  Esc 暂停/过  ·  R 规则  ·  M 静音  ·  F11 全屏", 12, Color(0.66, 0.74, 0.70, 0.72))
+	var control_hint := _ui_label("左键出牌  ·  P 碰/G 杠  ·  Esc 暂停/过  ·  R 规则  ·  M 静音  ·  F11 全屏", 12, Color(0.66, 0.74, 0.70, 0.72))
 	control_hint.anchor_left = 0.5
 	control_hint.anchor_right = 0.5
 	control_hint.anchor_top = 1.0
@@ -1981,7 +2107,7 @@ func _make_hud() -> void:
 	_claim_panel.anchor_right = 1.0
 	_claim_panel.anchor_top = 1.0
 	_claim_panel.anchor_bottom = 1.0
-	_claim_panel.offset_left = -440.0
+	_claim_panel.offset_left = -360.0
 	_claim_panel.offset_right = -24.0
 	_claim_panel.offset_top = -164.0
 	_claim_panel.offset_bottom = -24.0
@@ -1991,9 +2117,15 @@ func _make_hud() -> void:
 	var claim_box := VBoxContainer.new()
 	claim_box.add_theme_constant_override("separation", 8)
 	_claim_panel.add_child(claim_box)
-	var claim_title := _ui_label("可以响应 · 点击或按快捷键", 12, Color(0.88, 0.76, 0.50, 0.92))
-	claim_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	claim_box.add_child(claim_title)
+	var claim_header := HBoxContainer.new()
+	claim_header.alignment = BoxContainer.ALIGNMENT_END
+	claim_header.add_theme_constant_override("separation", 8)
+	claim_box.add_child(claim_header)
+	_claim_caption = _ui_label("", 16, Color(1.0, 0.87, 0.56))
+	_claim_caption.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	claim_header.add_child(_claim_caption)
+	_claim_faces = HBoxContainer.new()
+	claim_header.add_child(_claim_faces)
 	_claim_row = HBoxContainer.new()
 	_claim_row.alignment = BoxContainer.ALIGNMENT_END
 	_claim_row.add_theme_constant_override("separation", 8)
@@ -2397,6 +2529,68 @@ func _close_pause() -> void:
 	if _pause_resume:
 		_pause_resume.release_focus()
 
+func _make_recent_discard(parent: HBoxContainer) -> void:
+	_last_discard = HBoxContainer.new()
+	_last_discard.custom_minimum_size.x = 108
+	_last_discard.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_last_discard.alignment = BoxContainer.ALIGNMENT_CENTER
+	_last_discard.add_theme_constant_override("separation", 8)
+	parent.add_child(_last_discard)
+	_last_discard_icon = TextureRect.new()
+	_last_discard_icon.custom_minimum_size = Vector2(28, 38)
+	_last_discard_icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_last_discard_icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_last_discard_icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_last_discard.add_child(_last_discard_icon)
+	_last_discard_label = _ui_label("", 13, Color(0.90, 0.96, 0.92))
+	_last_discard_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_last_discard.add_child(_last_discard_label)
+
+
+func _make_seat_strip(parent: Control) -> void:
+	var strip := HBoxContainer.new()
+	strip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	strip.add_theme_constant_override("separation", 8)
+	parent.add_child(strip)
+	strip.anchor_left = 0.5
+	strip.anchor_right = 0.5
+	strip.offset_left = -266.0
+	strip.offset_right = 266.0
+	strip.offset_top = 91.0
+	strip.offset_bottom = 135.0
+	_active_seat_style = _panel_style(Color(0.23, 0.20, 0.10), Color(0.94, 0.70, 0.30), 8)
+	_idle_seat_style = _panel_style(Color(0.035, 0.085, 0.082), Color(0.19, 0.31, 0.29), 8)
+	for style in [_active_seat_style, _idle_seat_style]:
+		style.content_margin_left = 4
+		style.content_margin_right = 4
+		style.content_margin_top = 4
+		style.content_margin_bottom = 4
+	for seat in range(4):
+		var panel := PanelContainer.new()
+		panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		strip.add_child(panel)
+		_seat_cards.append(panel)
+		var caption := _ui_label(SEAT_NAMES[seat], 15, Color.WHITE)
+		caption.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		caption.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		panel.add_child(caption)
+		_seat_captions.append(caption)
+
+
+func _update_pace_button() -> void:
+	_pace_btn.text = "节奏：快速" if _quick_pace else "节奏：经典"
+
+
+func _toggle_pace() -> void:
+	var now := Time.get_ticks_msec() * 0.001
+	var remaining := maxf(0.0, st_deadline - now)
+	_quick_pace = not _quick_pace
+	st_deadline = now + remaining * (QUICK_PACE if _quick_pace else 1.0 / QUICK_PACE)
+	_update_pace_button()
+	_save_match_state()
+
+
 func _open_settings() -> void:
 	if _settings_overlay == null:
 		return
@@ -2446,10 +2640,14 @@ func _check_initial_win(force: bool = false) -> void:
 func _show_claim(opts: Array) -> void:
 	_set_hovered_hand(-1)
 	for c in _claim_row.get_children():
+		_claim_row.remove_child(c)
 		c.queue_free()
-	var names := { "gang": "杠  G", "peng": "碰  P" }
+	var supplement_key := "B" if "angang" in opts else "G"
+	var names := {"gang": "杠  G", "peng": "碰  P", "angang": "暗杠  G", "bugang": "补杠  " + supplement_key}
 	var accents := {
 		"gang": Color(0.76, 0.56, 0.24),
+		"angang": Color(0.76, 0.56, 0.24),
+		"bugang": Color(0.76, 0.56, 0.24),
 		"peng": Color(0.30, 0.58, 0.46),
 	}
 	var first_btn: Button
@@ -2473,25 +2671,53 @@ func _show_claim(opts: Array) -> void:
 	if first_btn == null:
 		first_btn = p
 	_claim_row.visible = true
+	_update_claim_preview(opts)
 	_claim_panel.visible = true
-	first_btn.call_deferred("grab_focus")
+	first_btn.grab_focus()
+	_update_hud()
+
+func _update_claim_preview(opts: Array) -> void:
+	for child in _claim_faces.get_children():
+		_claim_faces.remove_child(child)
+		child.queue_free()
+	var self_tiles: Dictionary = _human_pending.get("self_tiles", {})
+	if not self_tiles.is_empty():
+		_claim_caption.text = "可自杠 · 请选择"
+		for kind in opts:
+			_claim_faces.add_child(_make_result_tile(int(self_tiles[kind]), true))
+	elif _claim_from >= 0 and _claim_tile >= 0:
+		_claim_caption.text = "%s打出 %s" % [SEAT_NAMES[_claim_from], TILE_NAMES[_claim_tile]]
+		_claim_faces.add_child(_make_result_tile(_claim_tile, true))
+		if not rivers[_claim_from].is_empty() and rivers[_claim_from].back() == _claim_tile:
+			_show_river_marker(_claim_from, rivers[_claim_from].size() - 1)
+	else:
+		_claim_caption.text = "请选择操作"
+
+func _show_river_marker(seat: int, index: int) -> void:
+	var slot := _river_slot(seat, index)
+	_claim_marker.position = slot["pos"] + Vector3(0, 0.8, 0)
+	_claim_marker.rotation.y = slot["ry"]
+	_claim_marker.show()
+	_claim_arrow.show()
 
 func _on_claim(kind: String) -> void:
-	if _human_pending.is_empty():
+	if _human_pending.is_empty() or (kind != "pass" and not _claim_available(kind)):
 		return
+	var self_tiles: Dictionary = _human_pending.get("self_tiles", {})
 	_hide_claim()
+	if not self_tiles.is_empty():
+		if kind == "pass":
+			_set_state(St.HUMAN_DISCARD)
+			_update_hud()
+		else:
+			_do_self_kong(0, int(self_tiles[kind]), kind)
+		return
 	_apply_human_claim(_claim_from, _claim_tile, kind)
 
 func _claim_available(kind: String) -> bool:
 	return not _human_pending.is_empty() and kind in _human_pending.get("opts", [])
 
 func _apply_human_claim(from_seat: int, tile: int, kind: String) -> void:
-	if kind == "bugang":
-		_do_self_kong(0, _bugang_tile(0), "bugang")
-		return
-	if kind == "angang":
-		_do_self_kong(0, _angang_tile(0), "angang")
-		return
 	if kind == "pass" or kind == "":
 		_ev("你 过")
 		_ai_claims()
@@ -2534,6 +2760,8 @@ func _apply_human_claim(from_seat: int, tile: int, kind: String) -> void:
 		_build()
 		return
 func _hide_claim() -> void:
+	if _claim_marker:
+		_claim_marker.hide()
 	if _claim_row:
 		_claim_row.visible = false
 	if _claim_panel:
@@ -2543,7 +2771,19 @@ func _hide_claim() -> void:
 func _update_hud() -> void:
 	if hud == null:
 		return
-	var who: String = ["你", "下家", "对家", "上家"][turn]
+	var who: String = SEAT_NAMES[turn]
+	_last_discard.visible = _claim_from >= 0 and _claim_tile >= 0
+	if _last_discard.visible:
+		_last_discard_icon.texture = _face_texture(_claim_tile)
+		var source: String = "你打出" if _claim_from == 0 else SEAT_NAMES[_claim_from] + "打出"
+		_last_discard_label.text = "%s\n%s" % [source, TILE_NAMES[_claim_tile]]
+		# 只标出仍留在牌河里的那一张牌。
+		if _last_discard_index >= 0 and _last_discard_index < rivers[_claim_from].size():
+			_show_river_marker(_claim_from, _last_discard_index)
+		elif st != St.HUMAN_CLAIM:
+			_claim_marker.hide()
+	else:
+		_claim_marker.hide()
 	var ting := ""
 	var state := ""
 	if game_over:
@@ -2553,17 +2793,42 @@ func _update_hud() -> void:
 	elif turn == 0 and st == St.HUMAN_DISCARD:
 		state = "轮到你 · 请出牌"
 	elif st == St.CLAIM_WAIT:
-		state = "等待其他家响应"
+		state = "等待碰杠响应"
+	elif st == St.AI_DRAW:
+		state = "%s · 摸牌" % who
 	else:
-		state = "轮到 %s · 思考中" % who
-	if turn == 0 and not hands[0].is_empty() and (hands[0].size() + melds[0].size() * 3) % 3 == 1:
-		var w: Array = MJRules.waits(hands[0], melds[0])
-		if not w.is_empty():
-			ting = " · 听 %d 张" % w.size()
+		state = "%s · 选牌" % who
+	if not game_over and hands[0].size() + melds[0].size() * 3 == 13:
+		var waits := MJRules.waits(hands[0], melds[0])
+		if not waits.is_empty():
+			ting = " · 听 " + _format_waits(waits, _visible_tile_counts(hands[0]))
 	hud.text = state
-	hud.add_theme_color_override("font_color", Color(1.0, 0.91, 0.66) if turn == 0 and not game_over else Color(0.89, 0.94, 0.90))
-	_hud_hint.text = "牌墙 %d / 136 · 底分 %d%s" % [wall.size(), STAKE, ting]
+	var your_choice := not game_over and (st == St.HUMAN_CLAIM or (st == St.HUMAN_DISCARD and turn == 0))
+	hud.add_theme_color_override("font_color", Color(1.0, 0.91, 0.66) if your_choice else Color(0.89, 0.94, 0.90))
+	_status_style.border_color = Color(0.94, 0.70, 0.30) if your_choice else Color(0.28, 0.48, 0.44)
+	var can_discard: bool = your_choice and st == St.HUMAN_DISCARD and hands[0].size() + melds[0].size() * 3 == 14
+	if _update_hand_markers(can_discard):
+		ting = " · 打带「听」标记的牌即可听牌"
+	_hud_hint.text = "余牌 %d%s" % [wall.size(), ting]
 	_update_match_hud()
+
+
+func _update_hand_markers(can_discard: bool) -> bool:
+	var has_wait := false
+	var seen := _visible_tile_counts(hands[0]) if can_discard else {}
+	for i in range(_hand_markers.size()):
+		var marker := _hand_markers[i]
+		if not can_discard or i >= hands[0].size():
+			marker.hide()
+			continue
+		var preview := _discard_info(i, seen)
+		var will_listen := int(preview["live"]) > 0
+		var is_drawn := i == drawn_index
+		has_wait = has_wait or will_listen
+		marker.visible = will_listen or is_drawn
+		marker.text = "听" if will_listen else "摸"
+		marker.modulate = Color(1.0, 0.79, 0.35) if will_listen else Color(0.49, 0.94, 0.94)
+	return has_wait
 
 func _set_hovered_hand(index: int) -> void:
 	if index < 0 or index >= _hand_nodes.size():
@@ -2572,19 +2837,16 @@ func _set_hovered_hand(index: int) -> void:
 		return
 	if _hovered_index >= 0 and _hovered_index < _hand_nodes.size():
 		var old := _hand_nodes[_hovered_index]
-		if is_instance_valid(old):
+		if is_instance_valid(old) and old.is_inside_tree():
 			var base: Vector3 = old.get_meta("hover_base_scale", Vector3.ONE)
-			var out := create_tween()
-			out.tween_property(old, "scale", base, 0.13).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+			_tween_hand_scale(old, base, 0.13)
 	_hovered_index = index
 	if index >= 0:
 		var node := _hand_nodes[index]
 		var base_scale: Vector3 = node.get_meta("hover_base_scale", Vector3.ONE)
-		var tw := create_tween()
-		tw.tween_property(node, "scale", base_scale * 1.06, 0.15).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		_tween_hand_scale(node, base_scale * 1.06, 0.15)
 		if _hover_label:
-			var tile: int = int(hands[0][index])
-			_hover_label.text = "%s  ·  左键打出" % TILE_NAMES[tile]
+			_hover_label.text = _discard_preview(index)
 			_hover_label.visible = true
 		Input.set_default_cursor_shape(Input.CURSOR_POINTING_HAND)
 	else:
@@ -2592,22 +2854,60 @@ func _set_hovered_hand(index: int) -> void:
 			_hover_label.visible = false
 		Input.set_default_cursor_shape(Input.CURSOR_ARROW)
 
+func _tween_hand_scale(node: Node3D, target: Vector3, duration: float) -> void:
+	var previous := node.get_meta("hover_tween", null) as Tween if node.has_meta("hover_tween") else null
+	if previous and previous.is_valid():
+		previous.kill()
+	var tween := node.create_tween()
+	node.set_meta("hover_tween", tween)
+	tween.tween_property(node, "scale", target, duration).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+
+func _format_waits(waits: Array, seen: Dictionary) -> String:
+	var parts := PackedStringArray()
+	for tile in waits:
+		parts.append("%s %d" % [TILE_NAMES[tile], _live_copies(tile, seen)])
+	return "、".join(parts)
+
+func _discard_info(index: int, seen: Dictionary) -> Dictionary:
+	var hand: Array = hands[0]
+	var tile: int = int(hand[index])
+	if not _discard_previews.has(tile):
+		var probe := hand.duplicate()
+		probe.remove_at(index)
+		var waits := MJRules.waits(probe, melds[0])
+		var text := "%s · 左键打出" % TILE_NAMES[tile]
+		if not waits.is_empty():
+			text = "打%s后听 %s（估计余张）" % [TILE_NAMES[tile], _format_waits(waits, seen)]
+		_discard_previews[tile] = {"text": text, "live": _live_wait_count(waits, seen)}
+	return _discard_previews[tile]
+
+
+func _discard_preview(index: int) -> String:
+	return _discard_info(index, _visible_tile_counts(hands[0]))["text"]
+
+
 func _update_hover(mouse_pos: Vector2) -> void:
 	if game_over or turn != 0 or st != St.HUMAN_DISCARD or _claim_panel.visible:
 		_set_hovered_hand(-1)
 		return
-	for i in range(hands[0].size()):
-		if _hand_screen_rect(i).has_point(mouse_pos):
-			_set_hovered_hand(i)
-			return
-	_set_hovered_hand(-1)
+	_set_hovered_hand(_hand_index_at(mouse_pos))
 
-func _hand_screen_rect(i: int) -> Rect2:
-	var n: int = hands[0].size()
-	var x := _hand_x(i, n) - _hand_shift()
-	var a := cam.unproject_position(Vector3(x - HAND_W * 0.5, 0, HAND_Z))
-	var b := cam.unproject_position(Vector3(x + HAND_W * 0.5, HAND_H, HAND_Z))
-	return Rect2(min(a.x, b.x), min(a.y, b.y), abs(b.x - a.x), abs(b.y - a.y))
+func _hand_index_at(screen_pos: Vector2) -> int:
+	var origin := cam.project_ray_origin(screen_pos)
+	var direction := cam.project_ray_normal(screen_pos)
+	var bounds := AABB(Vector3(-HAND_W, -HAND_H, -HAND_T) * 0.5, Vector3(HAND_W, HAND_H, HAND_T + 2.2))
+	var closest := INF
+	var hit_index := -1
+	for i in range(_hand_nodes.size()):
+		var node := _hand_nodes[i]
+		var inverse := node.global_transform.affine_inverse()
+		var hit: Variant = bounds.intersects_ray(inverse * origin, inverse.basis * direction)
+		if hit is Vector3:
+			var distance := origin.distance_squared_to(node.global_transform * hit)
+			if distance < closest:
+				closest = distance
+				hit_index = i
+	return hit_index
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
@@ -2650,8 +2950,14 @@ func _input(event: InputEvent) -> void:
 						_on_claim("peng")
 						get_viewport().set_input_as_handled()
 				KEY_G:
-					if _claim_available("gang"):
-						_on_claim("gang")
+					for kind in ["gang", "angang", "bugang"]:
+						if _claim_available(kind):
+							_on_claim(kind)
+							get_viewport().set_input_as_handled()
+							break
+				KEY_B:
+					if _claim_available("bugang"):
+						_on_claim("bugang")
 						get_viewport().set_input_as_handled()
 				KEY_ESCAPE:
 					_on_claim("pass")
@@ -2667,6 +2973,9 @@ func _input(event: InputEvent) -> void:
 		return
 	if event is InputEventMouseMotion:
 		_update_hover(event.position)
+
+func _unhandled_input(event: InputEvent) -> void:
+	if _main_menu_open or _pause_open or _settings_open or _rules_open or game_over:
 		return
 	if not (event is InputEventMouseButton):
 		return
@@ -2674,10 +2983,10 @@ func _input(event: InputEvent) -> void:
 		return
 	if turn != 0 or phase != "discard" or st != St.HUMAN_DISCARD or _claim_panel.visible:
 		return
-	for i in range(hands[0].size()):
-		if _hand_screen_rect(i).has_point(event.position):
-			_player_discard(i)
-			return
+	var index := _hand_index_at(event.position)
+	if index >= 0:
+		_player_discard(index)
+		get_viewport().set_input_as_handled()
 
 func _auto_run() -> void:
 	auto_pass = true
@@ -2736,7 +3045,11 @@ func _ai_test() -> void:
 	hard_probe.remove_at(hard_idx)
 	var hard_waits: Array = MJRules.waits(hard_probe, [])
 	var elapsed := Time.get_ticks_usec() - started
-	var ok: bool = not waits.is_empty() and not hard_waits.is_empty()
+	hands[2] = [0, 1, 4, 6, 8, 9, 12, 14, 17, 19, 23, 27, 29, 31]
+	var spread_started := Time.get_ticks_usec()
+	var spread_choice := _ai_choose_discard(2)
+	print("AITEST spread_choice=", spread_choice, " spread_usec=", Time.get_ticks_usec() - spread_started)
+	var ok: bool = not waits.is_empty() and not hard_waits.is_empty() and spread_choice >= 0
 	print("AITEST normal=", TILE_NAMES[chosen], " waits=", waits, " hard=", TILE_NAMES[int(hands[1][hard_idx])], " hard_waits=", hard_waits, " hard_usec=", elapsed)
 	get_tree().quit(0 if ok else 1)
 
@@ -2937,11 +3250,13 @@ func _ui_shot_test() -> void:
 	_ev(">>> 对家 打 三万")
 	rivers[0] = [0, 1, 2, 9, 10, 11]
 	rivers[1] = [18, 19, 20]
-	rivers[2] = [27, 28]
+	rivers[2] = [27, 2]
 	rivers[3] = [31, 32]
 	melds[1] = [{ "type": "peng", "tiles": [5, 5, 5] }]
 	_build()
 	_human_pending = { "opts": ["peng", "gang"] }
+	_claim_from = 2
+	_claim_tile = int(rivers[2].back())
 	_set_state(St.HUMAN_CLAIM)
 	_show_claim(["peng", "gang"])
 	_toast("对家 碰 九筒")
@@ -3107,7 +3422,7 @@ func _label_test() -> void:
 	_build()
 	await get_tree().process_frame
 	var found := 0
-	for c in board.get_children():
+	for c in board.get_node("SeatLabels").get_children():
 		if c is Label3D:
 			print("LABEL ", c.text)
 			found += 1
@@ -3131,13 +3446,85 @@ func _river_test() -> void:
 	get_tree().quit()
 
 
+func _board_test() -> void:
+	hands[0] = [27,27,27,27,28,28,29,29,30,30,31,31,32,33]
+	drawn_index = 13
+	rivers[1] = [32]
+	_build()
+	var table := board.get_node("Table")
+	var wall_section := board.get_node("Wall")
+	var hand := _hand_nodes[13]
+	var click := cam.unproject_position(hand.global_position)
+	var hit_ok := _hand_index_at(click) == 13
+	var preview_ok := _discard_preview(13).contains("打白板后听 发财 2")
+	var marker_ok := _hand_markers[13].visible and _hand_markers[13].text == "听"
+	var count := wall.size()
+	wall.pop_back()
+	rivers[1].append(28)
+	_build()
+	var wall_tiles := wall_section.get_children()
+	var reuse_ok := table == board.get_node("Table") and hand == _hand_nodes[13]
+	var wall_ok: bool = wall_tiles[count - 2].visible and not wall_tiles[count - 1].visible
+
+	_claim_from = 1
+	_claim_tile = 28
+	_offer_human(["peng"])
+	var claim_ok := _claim_caption.text == "下家打出 南风" and _claim_faces.get_child_count() == 1 and _claim_marker.visible
+	_hide_claim()
+	claim_ok = claim_ok and not _claim_marker.visible
+	turn = 1
+	_enter_claim(1, 28)
+	var recent_ok := _last_discard.visible and _last_discard_label.text.contains("南风") and _claim_marker.visible
+	var turn_ok := _seat_cards[1].get_theme_stylebox("panel") == _active_seat_style
+	var fast_time := st_deadline - Time.get_ticks_msec() * 0.001
+	_toggle_pace()
+	var standard_time := st_deadline - Time.get_ticks_msec() * 0.001
+	var pace_ok := fast_time < 0.65 and standard_time > 0.85 and _pace_btn.text.contains("经典")
+	print("BOARDTEST hit=", hit_ok, " preview=", preview_ok, " reuse=", reuse_ok, " wall=", wall_ok, " claim=", claim_ok)
+	print("TABLE_GUIDES marker=", marker_ok, " recent=", recent_ok, " turn=", turn_ok, " fast_s=", fast_time, " classic_s=", standard_time)
+	get_tree().quit(0 if hit_ok and preview_ok and reuse_ok and wall_ok and claim_ok and marker_ok and recent_ok and turn_ok and pace_ok else 1)
+
+
+func _board_benchmark() -> void:
+	var samples: Array[int] = []
+	for i in range(40):
+		if i % 2 == 0:
+			rivers[1].append(i % KINDS)
+			turn = 1
+			_drop_seat = 1
+		elif not wall.is_empty():
+			wall.pop_back()
+			turn = 2
+		var start := Time.get_ticks_usec()
+		_build()
+		await get_tree().process_frame
+		samples.append(Time.get_ticks_usec() - start)
+	samples.sort()
+	print("BOARDBENCH median_us=", samples[20], " p95_us=", samples[37])
+	get_tree().quit()
+
+
 func _kong_test() -> void:
+	_new_game()
+	hands[0] = [5, 5, 5, 5, 0, 1, 2, 9, 10, 11, 18, 19, 27, 28]
+	_claim_from = 2
+	_claim_tile = 27
+	rivers[2] = [27]
+	var before: Array = hands[0].duplicate()
+	_offer_self_kong(0)
+	var menu_ok := _claim_row.visible and _claim_row.get_child_count() == 2
+	_on_claim("pass")
+	var pass_ok: bool = st == St.HUMAN_DISCARD and turn == 0 and hands[0] == before and rivers[2] == [27]
+	print("SELF_KONG_MENU visible=", menu_ok, " pass_returns_to_hand=", pass_ok)
 	_new_game()
 	melds[0] = [{ "type": "peng", "tiles": [5, 5, 5] }]
 	hands[0] = [5, 0, 1, 2, 9, 10, 11, 18, 19, 20, 27, 28]
 	wall = [3, 4, 6, 7, 8, 12]
-	auto_peng = true
 	_offer_self_kong(0)
+	var key := InputEventKey.new()
+	key.keycode = KEY_G
+	key.pressed = true
+	_input(key)
 	await get_tree().process_frame
 	var g: int = melds[0][0]["tiles"].size() if melds[0].size() > 0 else 0
 	print("KONG type=", melds[0][0]["type"] if melds[0].size() > 0 else "-", " tiles=", g, " hand=", hands[0].size(), " wall=", wall.size())
@@ -3147,7 +3534,7 @@ func _kong_test() -> void:
 	if hands[0].size() == 12: ok += 1
 	if scores == [3, -1, -1, -1]: ok += 1
 	print("KONGTEST ", ok, "/4 scores=", scores)
-	get_tree().quit(0 if ok == 4 else 1)
+	get_tree().quit(0 if ok == 4 and menu_ok and pass_ok else 1)
 
 
 func _rob_test() -> void:
@@ -3165,6 +3552,7 @@ func _rob_test() -> void:
 	if hands[0].size() == 14: ok += 1
 	if scores == [20, 0, -20, 0]: ok += 1
 	if result_detail and result_detail.text.contains("承包 20 分"): ok += 1
-	print("ROBTEST ", ok, "/4 scores=", scores)
-	get_tree().quit(0 if ok == 4 else 1)
+	if _count_in(hands[2], 5) == 0 and melds[2][0]["tiles"] == [5, 5, 5]: ok += 1
+	print("ROBTEST ", ok, "/5 scores=", scores)
+	get_tree().quit(0 if ok == 5 else 1)
 
